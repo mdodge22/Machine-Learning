@@ -1,0 +1,523 @@
+---
+title: "Final Project"
+author: "Max Dodge"
+date: "5/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(lubridate)
+library(tidyr)
+library(zoo)
+library(ISLR)
+library(splines)
+library(gam)
+library(rpart)
+library(rpart.plot)
+```
+
+### Data
+
+```{r}
+us_counties <- #Kaggle dataset originally from the NYT
+  read_csv("us-counties.csv")
+
+census_pop <- 
+  read_csv("CensusCountyPop.csv")
+
+mask_use <- 
+  read_csv("mask-use-by-county.csv")  #Kaggle dataset
+
+pfizer <- 
+  read_csv("COVID-19_Vaccine_Distribution_Allocations_by_Jurisdiction_-_Pfizer (1).csv", 
+    col_types = cols(`Week of Allocations` = col_date(format = "%m/%d/%Y"))) #CDC data
+
+moderna <- 
+  read_csv("COVID-19_Vaccine_Distribution_Allocations_by_Jurisdiction_-_Moderna.csv", 
+    col_types = cols(`Week of Allocations` = col_date(format = "%m/%d/%Y"))) #CDC data
+
+janssen <- 
+  read_csv("COVID-19_Vaccine_Distribution_Allocations_by_Jurisdiction_-_Janssen.csv", 
+    col_types = cols(`Week of Allocations` = col_date(format = "%m/%d/%Y"))) #CDC data
+```
+
+### Data Cleaning
+
+```{r}
+state_pop <- census_pop %>% 
+  filter(COUNTY == "000") %>% 
+  select(STNAME, POPESTIMATE2019)
+
+county_pop <- census_pop %>%
+  select(STATE,COUNTY,STNAME,CTYNAME,POPESTIMATE2019) %>%
+  mutate(fips = paste0(STATE, COUNTY)) %>% 
+  select(POPESTIMATE2019, fips)
+```
+
+```{r}
+covid_data <- us_counties %>% 
+  left_join(mask_use, by = c("fips" = "COUNTYFP"))
+
+covid_data <- covid_data %>% 
+  left_join(county_pop, by = "fips") %>% 
+  na.omit()
+
+covid_data <- covid_data %>% 
+  left_join(state_pop, by = c("state" = "STNAME")) %>% 
+  na.omit() %>% 
+  rename(pop_county = POPESTIMATE2019.x,
+         pop_state = POPESTIMATE2019.y)
+
+covid_data <- covid_data %>% 
+  left_join(janssen, by = (c("date" = "Week of Allocations", 
+                             "state" = "Jurisdiction"))) %>% 
+  rename(janssen_doses = `1st Dose Allocations`) %>% 
+  replace_na(list(janssen_doses = 0)) %>% 
+  left_join(pfizer, by = (c("date" = "Week of Allocations", 
+                             "state" = "Jurisdiction"))) %>% 
+  rename(pfizer_dose_1 = `1st Dose Allocations`,
+         pfizer_dose_2 = `2nd Dose Allocations`) %>% 
+  replace_na(list(pfizer_dose_1 = 0, pfizer_dose_2 = 0)) %>% 
+  left_join(moderna, by = (c("date" = "Week of Allocations", 
+                             "state" = "Jurisdiction"))) %>% 
+  rename(moderna_dose_1 = `1st Dose Allocations`,
+         moderna_dose_2 = `2nd Dose Allocations`) %>% 
+  replace_na(list(moderna_dose_1 = 0, moderna_dose_2 = 0))
+
+```
+
+### Creating New Variables
+
+```{r}
+covid_data <- covid_data %>% 
+  mutate(total_doses = janssen_doses + pfizer_dose_1 + pfizer_dose_2 + 
+           moderna_dose_1 + moderna_dose_2)
+
+covid_data <- covid_data %>%
+  filter(date > "2020-11-30") %>% 
+  mutate(prop_statepop = pop_county/pop_state) %>% 
+  mutate(estimated_doses = prop_statepop*total_doses) %>% 
+  mutate(cases_per10k = (10000*cases)/(pop_county))
+
+covid_data <- covid_data %>% 
+  mutate(severe_outbreak = (ifelse(cases_per10k >1000,"Severe","Not_Severe"))) 
+  
+```
+
+## Regression
+
+### Ordinary Least Squares Model
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(2021)
+
+OLS <- train(
+    cases_per10k ~ date+NEVER+ALWAYS+SOMETIMES+RARELY+FREQUENTLY+janssen_doses+pfizer_dose_1+pfizer_dose_2+moderna_dose_1+moderna_dose_2+total_doses+pop_county+estimated_doses, 
+    data = covid_data,
+    method = "lm",
+    trControl = trainControl(method = "cv", number = 10),
+    na.action = na.omit)
+
+```
+
+### Ordinary Least Squares Analysis
+
+```{r, warning=FALSE, message=FALSE}
+OLS_out <- covid_data %>% 
+  mutate(fitted = predict(OLS, newdata = covid_data),
+         resid = cases_per10k - fitted)
+
+```
+
+```{r}
+OLS_out %>% 
+  ggplot(aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Fitted values", y = "Residuals")
+
+```
+
+```{r}
+OLS_out %>% 
+  ggplot(aes(x = total_doses, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Alotted Total Doses", y = "Residuals")
+
+```
+
+```{r}
+OLS_out %>% 
+  ggplot(aes(x = date, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Date", y = "Residuals")
+
+```
+
+```{r}
+head(OLS$results %>% arrange(MAE),1)
+```
+
+```{r}
+coef(OLS$finalModel)
+```
+
+### Linear LASSO Model
+
+```{r}
+set.seed(2021)
+
+LASSO <- train(
+    cases_per10k ~ date+NEVER+ALWAYS+SOMETIMES+RARELY+FREQUENTLY+janssen_doses+pfizer_dose_1+
+      pfizer_dose_2+moderna_dose_1+moderna_dose_2+total_doses+pop_county+estimated_doses,
+    data = covid_data,
+    method = "glmnet",
+    tuneGrid = data.frame(alpha = 1, lambda = seq(0, 10, length.out = 100)),
+    trControl = trainControl(method = "cv", number = 10, selectionFunction = "oneSE"),
+    metric = "MAE",
+    na.action = na.omit)
+
+```
+
+### Linear LASSO Analysis
+
+```{r}
+LASSO_out <- covid_data %>% 
+  mutate(fitted = predict(LASSO, newdata = covid_data),
+         resid = cases_per10k - fitted)
+
+```
+
+```{r}
+LASSO_out %>% 
+  ggplot(aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Fitted values", y = "Residuals")
+
+```
+
+```{r}
+LASSO_out %>% 
+  ggplot(aes(x = total_doses, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Alotted Total Doses", y = "Residuals")
+
+```
+
+```{r}
+coef(LASSO$finalModel, LASSO$bestTune$lambda)
+```
+
+```{r}
+head(LASSO$results %>% arrange(MAE),1)
+```
+
+```{r}
+plot(LASSO)
+```
+
+### Linear Forward Stepwise Model
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(2021)
+
+ForwardSW <- train(
+    cases_per10k ~ date+NEVER+ALWAYS+SOMETIMES+RARELY+FREQUENTLY+janssen_doses+pfizer_dose_1+
+      pfizer_dose_2+moderna_dose_1+moderna_dose_2+total_doses+pop_county+estimated_doses,
+    data = covid_data,
+    method = "leapForward",
+    tuneGrid = data.frame(nvmax = 1:10),
+    trControl = trainControl(method = "cv", number = 10, selectionFunction = "oneSE"),
+    metric = "MAE",
+    na.action = na.omit)
+```
+
+### Linear Forward Stepwise Analysis
+
+```{r}
+ForwardSW_out <- covid_data %>% 
+  mutate(fitted = predict(ForwardSW, newdata = covid_data),
+         resid = cases_per10k - fitted)
+
+```
+
+```{r}
+ForwardSW_out %>% 
+  ggplot(aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Fitted values", y = "Residuals")
+
+```
+
+```{r}
+ForwardSW_out %>% 
+  ggplot(aes(x = total_doses, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Alotted Total Doses", y = "Residuals")
+
+```
+
+```{r}
+head(ForwardSW$results %>% arrange(MAE),1)
+```
+
+```{r}
+coef(ForwardSW$finalModel, ForwardSW$bestTune$nvmax)
+```
+
+### LASSO with Splines Model
+
+```{r}
+cs_lasso <- train(
+    cases_per10k ~ ns(date, 3)+ns(NEVER, 3)+ns(RARELY, 3)+ns(ALWAYS, 3)+ns(FREQUENTLY, 3)+
+      ns(pfizer_dose_1, 3)+ns(pfizer_dose_2, 3)+ns(janssen_doses, 3)+ns(SOMETIMES, 3)+
+      ns(moderna_dose_1, 3)+ns(moderna_dose_2, 3)+ns(pop_county, 3)+ns(total_doses, 3)+ns(estimated_doses, 3),
+    data = covid_data,
+    method = "glmnet",
+    tuneGrid = data.frame(alpha = 1, lambda = seq(0, 10, length.out = 100)),
+    trControl = trainControl(method = "cv", number = 10, selectionFunction = "oneSE"),
+    metric = "MAE",
+    na.action = na.omit)
+
+```
+
+### LASSO with Splines Analysis
+
+```{r}
+cs_lasso_out <- covid_data %>% 
+  mutate(fitted = predict(cs_lasso, newdata = covid_data),
+         resid = cases_per10k - fitted)
+
+```
+
+```{r}
+cs_lasso_out %>% 
+  ggplot(aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Fitted values", y = "Residuals")
+```
+
+```{r}
+cs_lasso_out %>% 
+  ggplot(aes(x = total_doses, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Alotted Total Doses", y = "Residuals")
+```
+
+```{r}
+head(cs_lasso$results %>% arrange(MAE),1)
+```
+
+```{r}
+plot(cs_lasso)
+```
+
+```{r}
+coef(cs_lasso$finalModel, LASSO$bestTune$lambda)
+```
+
+
+### Forward Stepwise with Splines Model
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(2021)
+
+cs_forward <- train(
+    cases_per10k ~  ns(date, 3)+ns(NEVER, 3)+ns(RARELY, 3)+ns(ALWAYS, 3)+ns(FREQUENTLY, 3)+
+      ns(pfizer_dose_1, 3)+ns(pfizer_dose_2, 3)+ns(janssen_doses, 3)+ns(SOMETIMES, 3)+
+      ns(moderna_dose_1, 3)+ns(moderna_dose_2, 3)+ns(pop_county, 3)+ns(total_doses, 3)+ns(estimated_doses, 3),
+    data = covid_data,
+    method = "leapForward",
+    tuneGrid = data.frame(nvmax = 1:10),
+    trControl = trainControl(method = "cv", number = 10, selectionFunction = "oneSE"),
+    metric = "MAE",
+    na.action = na.omit)
+
+```
+
+### Forward Stepwise with Splines Analysis
+
+```{r}
+cs_forward_out <- covid_data %>% 
+  mutate(fitted = predict(cs_forward, newdata = covid_data),
+         resid = cases_per10k - fitted)
+
+```
+
+```{r}
+cs_forward_out %>% 
+  ggplot(aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Fitted values", y = "Residuals")
+
+```
+
+```{r}
+cs_forward_out %>% 
+  ggplot(aes(x = total_doses, y = resid)) +
+  geom_point() +
+  geom_smooth() +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  labs(x = "Alotted Total Doses", y = "Residuals")
+
+```
+
+```{r}
+head(cs_forward$results %>% arrange(MAE),1)
+```
+
+```{r}
+coef(cs_forward$finalModel, ForwardSW$bestTune$nvmax)
+```
+
+## Classification
+
+### LASSO Logistic Regression Model
+
+```{r}
+twoClassSummaryCustom <- function (data, lev = NULL, model = NULL) {
+    if (length(lev) > 2) {
+        stop(paste("Your outcome has", length(lev), "levels. The twoClassSummary() function isn't appropriate."))
+    }
+    caret:::requireNamespaceQuietStop("pROC")
+    if (!all(levels(data[, "pred"]) == lev)) {
+        stop("levels of observed and predicted data do not match")
+    }
+    rocObject <- try(pROC::roc(data$obs, data[, lev[1]], direction = ">", 
+        quiet = TRUE), silent = TRUE)
+    rocAUC <- if (inherits(rocObject, "try-error")) 
+        NA
+    else rocObject$auc
+    out <- c(rocAUC, sensitivity(data[, "pred"], data[, "obs"], 
+        lev[1]), specificity(data[, "pred"], data[, "obs"], lev[2]))
+    out2 <- postResample(data[, "pred"], data[, "obs"])
+    out <- c(out, out2[1])
+    names(out) <- c("AUC", "Sens", "Spec", "Accuracy")
+    out
+} # This function is not my own, from exercise 10 (Evaluating Classification Models)
+
+set.seed(2021)
+
+lasso_log <- train(
+    severe_outbreak ~ date+NEVER+ALWAYS+SOMETIMES+
+      RARELY+FREQUENTLY+janssen_doses+pfizer_dose_1+
+      pfizer_dose_2+moderna_dose_1+moderna_dose_2+
+      total_doses+pop_county+estimated_doses,   
+    data = covid_data,
+    method = "glmnet",
+    family = "binomial",
+    tuneGrid = data.frame(alpha = 1, lambda = seq(0, 10, length.out = 100)),
+    trControl = trainControl(method = "cv", number = 10, selectionFunction = "oneSE", classProbs = TRUE, summaryFunction = twoClassSummaryCustom),
+    metric = "AUC",
+    na.action = na.omit
+)
+
+```
+
+### LASSO Logistic Regression Analyisis
+
+```{r}
+coef(lasso_log$finalModel, lasso_log$bestTune$lambda)
+```
+
+```{r}
+lasso_log$results %>%
+    filter(lambda==lasso_log$bestTune$lambda)
+```
+
+```{r}
+covid_data %>%
+    count(severe_outbreak)
+```
+
+```{r}
+# NIR
+298643/(92973 + 298643)
+```
+
+### Random Forest Model
+
+```{r}
+set.seed(2021)
+# This code takes a really long time(for me ~7 minutes)
+forest <- train(
+    severe_outbreak ~ date+NEVER+ALWAYS+SOMETIMES+
+      RARELY+FREQUENTLY+janssen_doses+pfizer_dose_1+
+      pfizer_dose_2+moderna_dose_1+moderna_dose_2+
+      total_doses+pop_county+estimated_doses,
+    data = covid_data,
+    method = "rf",
+    tuneGrid = data.frame(mtry = c(2,3,4,5)),
+    trControl = trainControl(method = "oob", selectionFunction = "best"),
+    metric = "Accuracy",
+    ntree = 50, 
+    na.action = na.omit
+)
+```
+
+### Random Forest Analysis
+
+```{r}
+plot(forest)
+```
+
+```{r}
+forest$results
+```
+
+```{r}
+forest$finalModel
+```
+
+```{r}
+variable_importance <- randomForest::importance(forest$finalModel)
+
+variable_importance <- data.frame(
+        predictor = rownames(variable_importance),
+        MeanDecreaseGini = variable_importance[,"MeanDecreaseGini"]
+    ) %>%
+    arrange(desc(MeanDecreaseGini))
+
+variable_importance
+```
+
